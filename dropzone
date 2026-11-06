@@ -1,0 +1,687 @@
+-- DROPZONE | Bots + Items + Players ESP + No Recoil + No Spread
+-- INSERT = open/close menu, drag the title bar to move it
+--
+-- Item colors:
+--   helmet / vest / backpack lvl 1 = yellow, lvl 2 = blue, lvl 3 = red
+--   ammo = cyan, scopes = purple, everything else = grey
+--
+-- No recoil / No spread:
+--   Both work on the live weapon tables found on the Luau heap.
+--   The first time you tick either one, a one-time scan (getgc) runs and
+--   the game freezes for ~40-50s. After that writes are instant.
+--   Only numeric slots are touched and only inside tables that carry the
+--   weapon signature, so UI strings / unrelated tables are left alone.
+--
+--   The game rebuilds those tables when you swap weapons / get in a
+--   vehicle, so the script watches the equipped tool and re-scans by
+--   itself ("Auto rescan", on by default). Writes are paused the moment
+--   the tool changes, so nothing is ever written into freed memory.
+--   Turning "Auto rescan" off keeps the old addresses; the manual
+--   "Rescan weapons" row then does it by hand.
+--
+-- Stop with: _G.DZ.stop()
+
+if _G.DZ then _G.DZ.stop() end
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UIS = game:GetService("UserInputService")
+local lp = Players.LocalPlayer
+local mouse = lp:GetMouse()
+
+local cfg = {
+    bots = true, botHP = true, botTracer = false,
+    players = true,
+    items = true,
+    helmet = true, vest = true, pack = true, ammo = false, scope = true, other = true,
+    itemTracer = false,
+    dist = true, range = 400,
+    norecoil = false, nospread = false, autoRescan = true,
+}
+
+local running = true
+local menuOpen = true
+local wx, wy = 280, 150
+local dragging, dragDX, dragDY = false, 0, 0
+local prevDown = false
+
+local C_BG   = Color3.fromRGB(16, 16, 20)
+local C_BAR  = Color3.fromRGB(28, 30, 38)
+local C_HOV  = Color3.fromRGB(38, 42, 54)
+local C_TXT  = Color3.fromRGB(228, 230, 238)
+local C_DIM  = Color3.fromRGB(130, 134, 148)
+local C_ACC  = Color3.fromRGB(0, 214, 158)
+local C_BOT  = Color3.fromRGB(255, 86, 86)
+local C_PLR  = Color3.fromRGB(86, 168, 255)
+
+local C_T1    = Color3.fromRGB(255, 212, 59)
+local C_T2    = Color3.fromRGB(66, 135, 245)
+local C_T3    = Color3.fromRGB(240, 70, 70)
+local C_AMMO  = Color3.fromRGB(0, 220, 255)
+local C_SCOPE = Color3.fromRGB(190, 110, 255)
+local C_MISC  = Color3.fromRGB(200, 200, 208)
+
+local TIER_COLOR = {[1] = C_T1, [2] = C_T2, [3] = C_T3}
+local SCOPE_NAMES = {RedDot = true, Holo = true, Canted = true,
+    Scope2x = true, Scope3x = true, Scope4x = true, Scope6x = true, Scope8x = true}
+
+-- returns category key, tier (or nil), color
+local function itemInfo(name)
+    local t = string.match(name, "^Helmet(%d)$")
+    if t then
+        local tier = tonumber(t)
+        return "helmet", tier, TIER_COLOR[tier] or C_T3
+    end
+    t = string.match(name, "^Vest(%d)$")
+    if t then
+        local tier = tonumber(t)
+        return "vest", tier, TIER_COLOR[tier] or C_T3
+    end
+    t = string.match(name, "^Backpack(%d)$")
+    if t then
+        local tier = tonumber(t)
+        return "pack", tier, TIER_COLOR[tier] or C_T3
+    end
+    if string.find(name, "^Ammo_") then return "ammo", nil, C_AMMO end
+    if SCOPE_NAMES[name] then return "scope", nil, C_SCOPE end
+    return "other", nil, C_MISC
+end
+
+-- ================= ESP POOLS =================
+local function mkSlot()
+    local box = Drawing.new("Square")
+    box.Thickness = 1; box.Filled = false; box.Visible = false
+    local txt = Drawing.new("Text")
+    txt.Size = 13; txt.Center = true; txt.Outline = true; txt.Font = 2; txt.Visible = false
+    local ln = Drawing.new("Line")
+    ln.Thickness = 1; ln.Visible = false
+    return {box = box, txt = txt, ln = ln}
+end
+
+local BOTN, ITEMN, PLRN = 32, 48, 16
+local botPool, itemPool, plrPool = {}, {}, {}
+for i = 1, BOTN do botPool[i] = mkSlot() end
+for i = 1, ITEMN do itemPool[i] = mkSlot() end
+for i = 1, PLRN do plrPool[i] = mkSlot() end
+
+-- ================= MENU =================
+local MW, TITLE_H, ROW_H, PAD, FOOT_H = 252, 26, 22, 8, 20
+local rows = {
+    {kind = "check", key = "bots",       label = "Bots ESP"},
+    {kind = "check", key = "botHP",      label = "Bots health"},
+    {kind = "check", key = "botTracer",  label = "Bots tracer"},
+    {kind = "check", key = "players",    label = "Players ESP"},
+    {kind = "check", key = "items",      label = "Items ESP"},
+    {kind = "check", key = "helmet",     label = "  Helmets"},
+    {kind = "check", key = "vest",       label = "  Vests"},
+    {kind = "check", key = "pack",       label = "  Backpacks"},
+    {kind = "check", key = "scope",      label = "  Scopes"},
+    {kind = "check", key = "ammo",       label = "  Ammo"},
+    {kind = "check", key = "other",      label = "  Other items"},
+    {kind = "check", key = "itemTracer", label = "Item tracer"},
+    {kind = "check", key = "dist",       label = "Show distance"},
+    {kind = "check", key = "norecoil",   label = "No recoil"},
+    {kind = "check", key = "nospread",   label = "No spread"},
+    {kind = "check", key = "autoRescan", label = "  Auto rescan"},
+    {kind = "action", key = "rescan",    label = "Rescan weapons"},
+    {kind = "range", key = "range",      label = "Item range"},
+}
+local MH = TITLE_H + 6 + #rows * ROW_H + FOOT_H
+
+local mBg = Drawing.new("Square")
+mBg.Filled = true; mBg.Rounding = 6; mBg.Color = C_BG; mBg.Transparency = 0.12
+local mBar = Drawing.new("Square")
+mBar.Filled = true; mBar.Rounding = 6; mBar.Color = C_BAR; mBar.Transparency = 0.05
+local mTitle = Drawing.new("Text")
+mTitle.Text = "DROPZONE"; mTitle.Size = 14; mTitle.Font = 2; mTitle.Color = C_ACC; mTitle.Outline = true
+local mSub = Drawing.new("Text")
+mSub.Text = "[INSERT]"; mSub.Size = 11; mSub.Font = 1; mSub.Color = C_DIM; mSub.Outline = true
+local mClose = Drawing.new("Text")
+mClose.Text = "x"; mClose.Size = 15; mClose.Font = 2; mClose.Center = true; mClose.Color = C_DIM; mClose.Outline = true
+local mFoot = Drawing.new("Text")
+mFoot.Text = ""; mFoot.Size = 11; mFoot.Font = 1; mFoot.Color = C_DIM; mFoot.Outline = true
+
+local rowDraw = {}
+for i = 1, #rows do
+    local bg = Drawing.new("Square")
+    bg.Filled = true; bg.Rounding = 4; bg.Color = C_HOV; bg.Transparency = 0.2; bg.Visible = false
+    local box = Drawing.new("Square")
+    box.Filled = false; box.Thickness = 1; box.Rounding = 3; box.Color = C_DIM
+    local fill = Drawing.new("Square")
+    fill.Filled = true; fill.Rounding = 2; fill.Color = C_ACC; fill.Visible = false
+    local lab = Drawing.new("Text")
+    lab.Text = rows[i].label; lab.Size = 13; lab.Font = 1; lab.Outline = true; lab.Color = C_TXT
+    local val = Drawing.new("Text")
+    val.Text = ""; val.Size = 11; val.Font = 2; val.Center = true; val.Outline = true; val.Color = C_ACC
+    rowDraw[i] = {bg = bg, box = box, fill = fill, lab = lab, val = val}
+end
+
+local function rowAt(px, py)
+    local top = wy + TITLE_H + 6
+    if px < wx + PAD or px > wx + MW - PAD then return 0 end
+    if py < top or py > top + #rows * ROW_H then return 0 end
+    return math.floor((py - top) / ROW_H) + 1
+end
+
+-- ================= HELPERS =================
+local function d3(a, b)
+    if not a or not b then return 9999 end
+    local dx, dy, dz = a.X - b.X, a.Y - b.Y, a.Z - b.Z
+    return math.sqrt(dx * dx + dy * dy + dz * dz)
+end
+
+local function project(a, b)
+    local pa, okA = WorldToScreen(a)
+    local pb, okB = WorldToScreen(b)
+    if okA and okB then return pa, pb end
+    return nil, nil
+end
+
+local function drawSet(list, pool, fallback, tracer, showHP, isItem, boxes, sw, sh)
+    local n = 0
+    local total = #pool
+    for i = 1, #list do
+        if n >= total then break end
+        local t = list[i]
+        local top, bot
+        if isItem then
+            local p = t.root.Position
+            top, bot = project(p + Vector3.new(0, 0.9, 0), p - Vector3.new(0, 0.9, 0))
+        else
+            top, bot = project(t.head.Position + Vector3.new(0, 0.8, 0), t.root.Position - Vector3.new(0, 3.1, 0))
+        end
+        if top and bot then
+            local h = bot.Y - top.Y
+            if h > 5 and h < 1200 then
+                n = n + 1
+                local s = pool[n]
+                local color = t.col or fallback
+                local w = h * 0.45
+                if boxes then
+                    s.box.Color = color
+                    s.box.Position = Vector2.new(top.X - w * 0.5, top.Y)
+                    s.box.Size = Vector2.new(w, h)
+                    s.box.Visible = true
+                else
+                    s.box.Visible = false
+                end
+                local label = t.name
+                if cfg.dist then label = label .. "  " .. tostring(math.floor(t.d)) .. "m" end
+                if showHP and t.hum then
+                    local hp = t.hum.Health
+                    if hp then label = label .. "  " .. tostring(math.floor(hp)) end
+                end
+                s.txt.Text = label
+                s.txt.Position = Vector2.new(top.X, top.Y - 16)
+                s.txt.Color = color
+                s.txt.Visible = true
+                if tracer then
+                    s.ln.From = Vector2.new(sw * 0.5, sh)
+                    s.ln.To = Vector2.new(bot.X, bot.Y)
+                    s.ln.Color = color
+                    s.ln.Visible = true
+                else
+                    s.ln.Visible = false
+                end
+            end
+        end
+    end
+    for i = n + 1, total do
+        local s = pool[i]
+        s.box.Visible = false
+        s.txt.Visible = false
+        s.ln.Visible = false
+    end
+    return n
+end
+
+-- ================= NO RECOIL / NO SPREAD =================
+-- WeaponState keys (live recoil accumulator)
+local STATE_KEYS = {
+    recoilAccum = true, hDrift = true, recovering = true, sprayCount = true, bloom = true,
+}
+-- static recoil stats, only inside a table that carries the recoil signature
+local REC_KEYS = {
+    V = true, H = true, Kick = true, RecoverySpeed = true,
+}
+-- static spread stats, only inside a table that carries the spread signature
+local SP_KEYS = {
+    Hip = true, ADS = true, Aim = true,
+    Bloom = true, BloomMax = true, BloomRecover = true,
+    PelletSpread = true, pelletH = true, pelletV = true,
+}
+
+local RC_SCAN = {"recoilAccum", "hDrift", "recovering", "sprayCount", "bloom",
+    "V", "H", "Kick", "RecoverySpeed"}
+local SP_SCAN = {"Hip", "ADS", "Aim", "Bloom", "BloomMax", "BloomRecover",
+    "PelletSpread", "pelletH", "pelletV"}
+
+local anti = {
+    rcOn = false, spOn = false,
+    scanning = false, ready = false,
+    coverRc = false, coverSp = false,
+    stale = false, staleAt = 0, lastScanAt = 0,
+    rcCache = {}, spCache = {}, rcKeys = {}, spKeys = {},
+    rcCount = 0, spCount = 0, err = nil,
+}
+
+local function pickKeys(cache, keys)
+    local out = {}
+    for _, e in ipairs(cache) do keys[e.key] = true end
+    for k in pairs(keys) do
+        if k ~= true then out[#out + 1] = k end
+    end
+    table.sort(out)
+    return out
+end
+
+local function antiScan()
+    if anti.scanning then return end
+    local wantRc, wantSp = anti.rcOn, anti.spOn
+    if not (wantRc or wantSp) then return end
+
+    local keys, seen = {}, {}
+    if wantRc then
+        for _, k in ipairs(RC_SCAN) do
+            if not seen[k] then seen[k] = true; keys[#keys + 1] = k end
+        end
+    end
+    if wantSp then
+        for _, k in ipairs(SP_SCAN) do
+            if not seen[k] then seen[k] = true; keys[#keys + 1] = k end
+        end
+    end
+
+    anti.scanning = true
+    anti.err = nil
+    anti.lastScanAt = tick()
+    print("[DZ] scanning " .. tostring(#keys) .. " keys, freeze incoming...")
+    task.spawn(function()
+        local ok, c = pcall(function() return getgc(keys) end)
+        if not (ok and type(c) == "table" and #c > 0) then
+            anti.scanning = false
+            anti.err = tostring(c)
+            print("[DZ] scan failed: " .. tostring(c))
+            return
+        end
+
+        -- group numeric slots by containing table
+        local num = {}
+        for _, e in ipairs(c) do
+            if e.type == "number" then
+                local t = num[e.tbl]
+                if not t then t = {}; num[e.tbl] = t end
+                t[e.key] = e
+            end
+        end
+
+        local rc, sp = {}, {}
+        local rk, sk = {}, {}
+        for _, m in pairs(num) do
+            local isState  = m.recoilAccum ~= nil and m.hDrift ~= nil
+            local isRecoil = m.RecoverySpeed ~= nil and m.V ~= nil and m.H ~= nil
+            local isSpread = m.BloomMax ~= nil and (m.Aim ~= nil or m.ADS ~= nil or m.Bloom ~= nil)
+            for k, e in pairs(m) do
+                if (isState and STATE_KEYS[k]) or (isRecoil and REC_KEYS[k]) then
+                    rc[#rc + 1] = e
+                    rk[k] = true
+                end
+                if isSpread and SP_KEYS[k] then
+                    sp[#sp + 1] = e
+                    sk[k] = true
+                end
+            end
+        end
+
+        -- fallback: no signature matched at all, take the unmistakable keys only
+        if #rc == 0 then
+            for _, e in ipairs(c) do
+                if e.type == "number" and STATE_KEYS[e.key] then
+                    rc[#rc + 1] = e
+                    rk[e.key] = true
+                end
+            end
+        end
+        if #sp == 0 then
+            local only = {Bloom = true, BloomMax = true, BloomRecover = true,
+                PelletSpread = true, pelletH = true, pelletV = true}
+            for _, e in ipairs(c) do
+                if e.type == "number" and only[e.key] then
+                    sp[#sp + 1] = e
+                    sk[e.key] = true
+                end
+            end
+        end
+
+        anti.rcCache, anti.spCache = rc, sp
+        anti.rcKeys, anti.spKeys = pickKeys(rc, rk), pickKeys(sp, sk)
+        anti.rcCount, anti.spCount = #rc, #sp
+        anti.ready = true
+        anti.coverRc, anti.coverSp = wantRc, wantSp
+        anti.stale = false
+        anti.scanning = false
+        print("[DZ] scan done: recoil=" .. tostring(#rc) .. " slots [" ..
+            table.concat(anti.rcKeys, ",") .. "]  spread=" .. tostring(#sp) ..
+            " slots [" .. table.concat(anti.spKeys, ",") .. "]")
+    end)
+end
+
+local function antiReset(doScan)
+    if anti.scanning then return end
+    anti.ready = false
+    anti.coverRc, anti.coverSp = false, false
+    anti.rcCache, anti.spCache = {}, {}
+    anti.rcKeys, anti.spKeys = {}, {}
+    anti.rcCount, anti.spCount = 0, 0
+    if doScan then antiScan() end
+end
+
+-- writes run only while the cache is known fresh
+task.spawn(function()
+    while running do
+        local wantRc, wantSp = anti.rcOn, anti.spOn
+        if wantRc or wantSp then
+            local missCover = (wantRc and not anti.coverRc) or (wantSp and not anti.coverSp)
+            if anti.stale then
+                -- weapon tables were rebuilt: do not touch them until re-scan
+            elseif not anti.ready or missCover then
+                if not anti.scanning then antiScan() end
+            else
+                if wantRc then
+                    for _, k in ipairs(anti.rcKeys) do
+                        pcall(applygc, anti.rcCache, k, 0)
+                    end
+                end
+                if wantSp then
+                    for _, k in ipairs(anti.spKeys) do
+                        pcall(applygc, anti.spCache, k, 0)
+                    end
+                end
+            end
+            task.wait(0.04)
+        else
+            task.wait(0.25)
+        end
+    end
+end)
+
+-- watch the equipped tool: switching weapon / getting in a vehicle rebuilds
+-- the weapon tables, so the old addresses go stale
+task.spawn(function()
+    local function toolSig()
+        local ch = lp.Character
+        if not ch then return "" end
+        local t = {}
+        for _, c in ipairs(ch:GetChildren()) do
+            if c.ClassName == "Tool" then t[#t + 1] = c.Name end
+        end
+        table.sort(t)
+        return table.concat(t, ",")
+    end
+
+    local last = toolSig()
+    while running do
+        task.wait(0.4)
+        local cur = toolSig()
+        if cur ~= last then
+            last = cur
+            anti.stale = true
+            anti.staleAt = tick()
+        end
+        if anti.stale and cfg.autoRescan and (anti.rcOn or anti.spOn)
+            and not anti.scanning
+            and (tick() - anti.staleAt) > 1.2
+            and (tick() - anti.lastScanAt) > 8 then
+            antiReset(true)
+        end
+    end
+end)
+
+-- ================= DATA =================
+local bots, items, plrs = {}, {}, {}
+
+local function refPos()
+    local c = lp.Character
+    local r = c and c:FindFirstChild("HumanoidRootPart")
+    if r then return r.Position end
+    local cam = workspace.CurrentCamera
+    return cam and cam.Position or nil
+end
+
+task.spawn(function()
+    while running do
+        local pos = refPos()
+        local ws = game.Workspace
+        local bl, il, pl = {}, {}, {}
+        if cfg.bots or cfg.botTracer then
+            local live = ws:FindFirstChild("Live")
+            if live then
+                for _, m in ipairs(live:GetChildren()) do
+                    local head = m:FindFirstChild("Head")
+                    local root = m:FindFirstChild("HumanoidRootPart")
+                    if head and root then
+                        bl[#bl + 1] = {name = m.Name, head = head, root = root,
+                            hum = m:FindFirstChildOfClass("Humanoid"), d = d3(pos, root.Position)}
+                    end
+                end
+                table.sort(bl, function(a, b) return a.d < b.d end)
+            end
+        end
+        if cfg.items or cfg.itemTracer then
+            local loot = ws:FindFirstChild("Loot")
+            if loot then
+                for _, m in ipairs(loot:GetChildren()) do
+                    if m.ClassName == "Model" then
+                        local root = m:FindFirstChild("RootPart")
+                        if root then
+                            local cat, tier, col = itemInfo(m.Name)
+                            if cfg[cat] then
+                                local d = d3(pos, root.Position)
+                                if d <= cfg.range then
+                                    il[#il + 1] = {name = m.Name, root = root, d = d, col = col, tier = tier}
+                                end
+                            end
+                        end
+                    end
+                end
+                table.sort(il, function(a, b) return a.d < b.d end)
+            end
+        end
+        if cfg.players then
+            for _, p in ipairs(Players:GetPlayers()) do
+                if p ~= lp then
+                    local char = p.Character
+                    local head = char and char:FindFirstChild("Head")
+                    local root = char and char:FindFirstChild("HumanoidRootPart")
+                    if head and root then
+                        pl[#pl + 1] = {name = p.Name, head = head, root = root,
+                            hum = char:FindFirstChildOfClass("Humanoid"), d = d3(pos, root.Position)}
+                    end
+                end
+            end
+            table.sort(pl, function(a, b) return a.d < b.d end)
+        end
+        bots, items, plrs = bl, il, pl
+        task.wait(0.5)
+    end
+end)
+
+-- ================= RENDER =================
+local getX = function() return mouse.X end
+local getY = function() return mouse.Y end
+
+local conn = RunService.RenderStepped:Connect(function()
+    local okx, px = pcall(getX)
+    local oky, py = pcall(getY)
+    if not (okx and oky) then px, py = -1, -1 end
+    local cam = workspace.CurrentCamera
+    local sw, sh = 1920, 1080
+    if cam then
+        local vp = cam.ViewportSize
+        if vp then sw, sh = vp.X, vp.Y end
+    end
+    local nb = drawSet(bots, botPool, C_BOT, cfg.botTracer, cfg.botHP, false, true, sw, sh)
+    local ni = drawSet(items, itemPool, C_MISC, cfg.itemTracer, false, true, cfg.items, sw, sh)
+    local np = drawSet(plrs, plrPool, C_PLR, false, true, false, true, sw, sh)
+
+    if menuOpen then
+        local hover = rowAt(px, py)
+        mBg.Visible = true; mBar.Visible = true
+        mTitle.Visible = true; mSub.Visible = true
+        mClose.Visible = true; mFoot.Visible = true
+        mBg.Position = Vector2.new(wx, wy)
+        mBg.Size = Vector2.new(MW, MH)
+        mBar.Position = Vector2.new(wx, wy)
+        mBar.Size = Vector2.new(MW, TITLE_H)
+        mTitle.Position = Vector2.new(wx + PAD, wy + 4)
+        mSub.Position = Vector2.new(wx + PAD + 78, wy + 8)
+        mClose.Position = Vector2.new(wx + MW - 15, wy + 13)
+        mFoot.Text = "bots " .. tostring(nb) .. "   items " .. tostring(ni) .. "   players " .. tostring(np)
+        mFoot.Position = Vector2.new(wx + PAD, wy + MH - 16)
+
+        local top = wy + TITLE_H + 6
+        for i, r in ipairs(rows) do
+            local o = rowDraw[i]
+            local y = top + (i - 1) * ROW_H
+            local on = cfg[r.key]
+            o.bg.Position = Vector2.new(wx + PAD, y)
+            o.bg.Size = Vector2.new(MW - PAD * 2, ROW_H - 2)
+            o.bg.Visible = (hover == i)
+            o.lab.Visible = true
+            o.lab.Position = Vector2.new(wx + PAD + 26, y + 3)
+            o.lab.Color = on and C_TXT or C_DIM
+
+            if r.kind == "check" then
+                o.box.Visible = true
+                o.box.Position = Vector2.new(wx + PAD + 7, y + 4)
+                o.box.Size = Vector2.new(12, 12)
+                o.fill.Visible = on
+                o.fill.Position = Vector2.new(wx + PAD + 10, y + 7)
+                o.fill.Size = Vector2.new(6, 6)
+                if r.key == "norecoil" or r.key == "nospread" then
+                    o.val.Visible = true
+                    if anti.scanning then
+                        o.val.Text = "scan"
+                        o.val.Color = C_AMMO
+                    elseif anti.stale then
+                        o.val.Text = "stale"
+                        o.val.Color = C_AMMO
+                    elseif not anti.ready then
+                        o.val.Text = anti.err and "err" or ""
+                        o.val.Color = C_DIM
+                    else
+                        o.val.Text = on and "on" or "off"
+                        o.val.Color = on and C_ACC or C_DIM
+                    end
+                    o.val.Position = Vector2.new(wx + MW - PAD - 34, y + 11)
+                else
+                    o.val.Visible = false
+                end
+            elseif r.kind == "action" then
+                o.box.Visible = false
+                o.fill.Visible = false
+                o.val.Visible = true
+                o.val.Text = anti.scanning and "scan" or (anti.ready and "re" or "run")
+                o.val.Color = anti.scanning and C_AMMO or C_ACC
+                o.val.Position = Vector2.new(wx + MW - PAD - 34, y + 11)
+            else
+                o.box.Visible = false
+                o.fill.Visible = false
+                o.val.Visible = true
+                o.val.Color = C_ACC
+                o.val.Text = "-  " .. tostring(cfg.range) .. "m  +"
+                o.val.Position = Vector2.new(wx + MW - PAD - 46, y + 11)
+            end
+        end
+
+        local down = ismouse1pressed()
+        if down and not prevDown and px > 0 then
+            if px >= wx and px <= wx + MW and py >= wy and py <= wy + MH then
+                if py <= wy + TITLE_H then
+                    if px >= wx + MW - 28 then
+                        menuOpen = false
+                    else
+                        dragging = true
+                        dragDX = px - wx
+                        dragDY = py - wy
+                    end
+                else
+                    local idx = rowAt(px, py)
+                    if idx > 0 then
+                        local r = rows[idx]
+                        if r.kind == "check" then
+                            cfg[r.key] = not cfg[r.key]
+                            if r.key == "norecoil" then
+                                anti.rcOn = cfg.norecoil
+                                if anti.rcOn and (not anti.ready or anti.stale) then antiReset(true) end
+                            elseif r.key == "nospread" then
+                                anti.spOn = cfg.nospread
+                                if anti.spOn and (not anti.ready or anti.stale) then antiReset(true) end
+                            end
+                        elseif r.kind == "action" then
+                            if not anti.scanning then antiReset(true) end
+                        else
+                            if px > wx + MW - PAD - 46 then
+                                cfg.range = math.min(1000, cfg.range + 50)
+                            else
+                                cfg.range = math.max(50, cfg.range - 50)
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        if down and dragging and px > 0 then
+            wx = px - dragDX
+            wy = py - dragDY
+        end
+        if not down then dragging = false end
+        prevDown = down
+    else
+        mBg.Visible = false; mBar.Visible = false
+        mTitle.Visible = false; mSub.Visible = false
+        mClose.Visible = false; mFoot.Visible = false
+        for i = 1, #rows do
+            local o = rowDraw[i]
+            o.bg.Visible = false; o.box.Visible = false; o.fill.Visible = false
+            o.lab.Visible = false; o.val.Visible = false
+        end
+        dragging = false
+        prevDown = ismouse1pressed()
+    end
+end)
+
+local keyConn = UIS.InputBegan:Connect(function(e)
+    if e.KeyCode == 277 then menuOpen = not menuOpen end
+end)
+
+-- ================= UNLOAD =================
+_G.DZ = {
+    cfg = cfg,
+    anti = anti,
+    rescan = function() antiReset(true) end,
+    stop = function()
+        running = false
+        if conn then conn:Disconnect() end
+        if keyConn then keyConn:Disconnect() end
+        for i = 1, BOTN do
+            botPool[i].box:Remove(); botPool[i].txt:Remove(); botPool[i].ln:Remove()
+        end
+        for i = 1, ITEMN do
+            itemPool[i].box:Remove(); itemPool[i].txt:Remove(); itemPool[i].ln:Remove()
+        end
+        for i = 1, PLRN do
+            plrPool[i].box:Remove(); plrPool[i].txt:Remove(); plrPool[i].ln:Remove()
+        end
+        mBg:Remove(); mBar:Remove(); mTitle:Remove(); mSub:Remove(); mClose:Remove(); mFoot:Remove()
+        for i = 1, #rows do
+            local o = rowDraw[i]
+            o.bg:Remove(); o.box:Remove(); o.fill:Remove(); o.lab:Remove(); o.val:Remove()
+        end
+        _G.DZ = nil
+        print("[DZ] unloaded")
+    end,
+}
+
+print("[DZ] loaded | bots=" .. tostring(#bots) .. " items=" .. tostring(#items) .. " range=" .. tostring(cfg.range))
+print("[DZ] INSERT = menu | stop: _G.DZ.stop()")
